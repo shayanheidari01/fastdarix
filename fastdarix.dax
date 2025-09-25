@@ -1,0 +1,245 @@
+// framework/fastdarix.dax - FastDariX: a minimal web microframework for DariX
+// Depends on native modules: go:httpserver
+// Usage:
+//   import "framework/fastdarix.dax"
+//   var app = FastApp(8080)
+//   @app.get("/")
+//   func home(req) {
+//     return {"message": "Hello, FastDariX!"}
+//   }
+//   app.run()
+
+import "go:httpserver"
+import "go:time"
+
+// Global registry for current app (single-app mode)
+var __fd_current_app = null
+
+// Named dispatcher that native server can call (no closures)
+func __fd_dispatch(request, response) {
+  if (__fd_current_app == null) {
+    print("[FastDariX] No current app set")
+    return response_status(response, 500)
+  }
+
+  // Attempt to read method and path from request
+  var method = request_get_header(request, "X-Method")
+  if (method == null || method == "") { method = request["method"] }
+  if (method == null || method == "") { method = "GET" }
+  var path = request_get_header(request, "X-Path")
+  if (path == null || path == "") { path = request["path"] }
+  if (path == null || path == "") { path = "/" }
+
+  // Log basic hit
+  print("HIT: " + method + " " + path)
+
+  // Find matching route
+  var app = __fd_current_app
+  var matched = null
+  for (var i = 0; i < len(app.routes); i = i + 1) {
+    var entry = app.routes[i]
+    if (entry[0] == method && entry[1] == path) {
+      matched = entry
+      break
+    }
+  }
+
+  if (matched == null) {
+    // Not found; let server handle 404 or respond here
+    return response_status(response, 404)
+  }
+
+  var handler = matched[2]
+  // Call user handler (try (req,res) then (req))
+  var result = handler(request, response)
+  if (type(result) == "ERROR") {
+    result = handler(request)
+  }
+  if (type(result) == "ERROR") {
+    response_status(response, 500)
+    return response_text(response, "Handler error")
+  }
+  return app._send_auto(response, result)
+}
+
+// Helper to detect type name
+func _type_name(x) {
+  return type(x)
+}
+
+// Create application
+class FDApp {
+  func __init__(self, port) {
+    self.port = port
+    self.server = server_create(port)         // MAP returned from native module
+    self.server_id = self.server["server_id"] // string id needed by server_* fns
+    self.routes = []
+    self.middlewares = []
+    self._started = false
+    self._log = false
+  }
+
+  // Register generic route via decorator factory
+  func route(self, method, path) {
+    return func (handler) {
+      // Register but actual binding to http server happens in run()
+      self.routes = append(self.routes, [method, path, handler])
+      return handler // return original handler unchanged
+    }
+  }
+
+  // HTTP method helpers
+  func get(self, path)  { return self.route("GET", path) }
+  func post(self, path) { return self.route("POST", path) }
+  func put(self, path)  { return self.route("PUT", path) }
+  func patch(self, path){ return self.route("PATCH", path) }
+  func delete(self, path)  { return self.route("DELETE", path) }
+  func options(self, path){ return self.route("OPTIONS", path) }
+  func head(self, path) { return self.route("HEAD", path) }
+
+  // Static files
+  func static(self, url_path, dir_path) {
+    self.routes = append(self.routes, ["STATIC", url_path, dir_path])
+  }
+
+  // Middleware: function(req, res, next)
+  func use(self, middleware_fn) {
+    self.middlewares = append(self.middlewares, [middleware_fn])
+  }
+
+  // Enable simple request logging
+  func enable_logs(self) {
+    self._log = true
+    // Register as a normal middleware so it is added in run() before server_start
+    self.use(func (req, res, next) {
+      var m = req["method"]
+      var p = req["path"]
+      if (m == null || m == "") { m = "(unknown)" }
+      if (p == null || p == "") { p = "(unknown)" }
+      print("➡️  " + m + " " + p + " @ " + str(time_now()))
+      return next()
+    })
+  }
+
+  // Response helper: send value automatically based on type
+  func _send_auto(self, res, value) {
+    var t = _type_name(value)
+    if (t == "MAP" || t == "ARRAY") {
+      response_json(res, value)
+      return
+    }
+    if (t == "STRING") {
+      response_text(res, value)
+      return
+    }
+    if (t == "INTEGER" || t == "FLOAT" || t == "BOOLEAN") {
+      response_text(res, str(value))
+      return
+    }
+    if (t == "NULL") {
+      response_status(res, 204)
+      return
+    }
+    // Fallback
+    response_text(res, str(value))
+  }
+
+  // Start server and bind all routes
+  func run(self) {
+    if (self._started) { return }
+
+    // Register middlewares
+    // If logging enabled, ensure a logging middleware is attached here too
+    if (self._log) {
+      server_middleware(self.server_id, func (req, res, next) {
+        var m = req["method"]
+        var p = req["path"]
+        if (m == null || m == "") { m = "(unknown)" }
+        if (p == null || p == "") { p = "(unknown)" }
+        print("➡️  " + m + " " + p + " @ " + str(time_now()))
+        return next()
+      })
+    }
+    for (var i = 0; i < len(self.middlewares); i = i + 1) {
+      var mwrap = self.middlewares[i][0]
+      server_middleware(self.server_id, func (req, res, next) {
+        // User middleware signature: (req, res, next)
+        // Call user middleware and then next()
+        var maybe = mwrap(req, res, next)
+        // If user returns explicitly and doesn't call next, we still respect response
+        return maybe
+      })
+    }
+
+    // Set current app for dispatcher and register routes
+    __fd_current_app = self
+    // Register routes
+    for (var i = 0; i < len(self.routes); i = i + 1) {
+      var entry = self.routes[i]
+      var kind = entry[0]
+      if (kind == "STATIC") {
+        var urlp = entry[1]
+        var dirp = entry[2]
+        server_static(self.server_id, urlp, dirp)
+      } else {
+        var method = entry[0]
+        var path = entry[1]
+        // Register the named dispatcher for all dynamic routes
+        server_route(self.server_id, method, path, __fd_dispatch)
+      }
+    }
+
+    // Start server and block to keep process alive
+    var started = server_start(self.server_id)
+    self._started = true
+
+    // Basic startup logs
+    if (type(started) == "MAP") {
+      var addr = started["address"]
+      var port = started["port"]
+      print("🚀 FastDariX server started at http://localhost" + addr + " (port " + str(port) + ")")
+    } else {
+      print("🚀 FastDariX server started")
+    }
+    print("🛣️  Registered routes: " + str(len(self.routes)))
+
+    // Keep process alive (sleep loop). Press Ctrl+C to terminate.
+    while (true) {
+      time_sleep(1)
+    }
+  }
+
+  // Start server without blocking (background). Use with caution; your script will exit.
+  func run_background(self) {
+    if (self._started) { return }
+    // Register middlewares and routes, same as run()
+    for (var i = 0; i < len(self.middlewares); i = i + 1) {
+      var mwrap = self.middlewares[i][0]
+      server_middleware(self.server_id, func (req, res, next) { var maybe = mwrap(req, res, next); return maybe })
+    }
+    for (var i = 0; i < len(self.routes); i = i + 1) {
+      var entry = self.routes[i]
+      var kind = entry[0]
+      if (kind == "STATIC") {
+        server_static(self.server_id, entry[1], entry[2])
+      } else {
+        var method = entry[0]
+        var path = entry[1]
+        var handler = entry[2]
+        server_route(self.server_id, method, path, func (req, res) {
+          var result = handler(req, res)
+          if (type(result) == "ERROR") { result = handler(req) }
+          if (type(result) == "ERROR") { response_status(res, 500); response_text(res, "Handler error"); return }
+          self._send_auto(res, result)
+        })
+      }
+    }
+    server_start(self.server_id)
+    self._started = true
+  }
+}
+
+// Public factory function (keeps nice API name)
+func FastApp(port) {
+  return FDApp(port)
+}

@@ -1,0 +1,43 @@
+// examples/fastdarix_demo.dax - Demo app for FastDariX microframework
+// Start: darix run examples/fastdarix_demo.dax --allow=*
+
+import "framework/fastdarix.dax"
+import "go:time"
+
+var app = FastApp(8080)
+
+app.enable_logs()
+
+// Simple middleware to add basic logging
+app.use(func (req, res, next) {
+  var now = now()
+  // continue to next middleware/handler
+  next()
+})
+
+// GET /
+@app.get("/")
+func home(req) {
+  return {"message": "Hello, FastDariX!", "time": now()}
+}
+
+// GET /hello/:name (simple query param)
+@app.get("/hello")
+func hello(req) {
+  var name = request_get_param(req, "name")
+  if (name == null) { name = "world" }
+  return {"greet": "hello", "name": name}
+}
+
+// POST /echo - echoes JSON or text
+@app.post("/echo")
+func echo(req) {
+  var body = request_get_body(req)
+  // If body looks like JSON, just return it, otherwise return text
+  return {"you_sent": body}
+}
+
+// Static files from ./public under /static
+app.static("/static", "public")
+
+app.run()
